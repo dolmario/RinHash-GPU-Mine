@@ -1,0 +1,4 @@
+*.o
+rinhash_cuda
+run.log
+.DS_Store
