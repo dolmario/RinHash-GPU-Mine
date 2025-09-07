@@ -1,6 +1,8 @@
-#include "rinhash_params.h"
+
 // main_cuda.c — Complete RinHash CUDA Miner
 // Full GPU Pipeline: BLAKE3(GPU) -> Argon2d(GPU) -> SHA3-256(GPU) -> target check -> submit
+
+#include "rinhash_params.h"
 
 #include <cuda_runtime.h>
 
@@ -730,39 +732,44 @@ static void cuda_free_full_buffers(cuda_full_buffers_t *buf) {
     if (buf->h_final_hashes) cudaFreeHost(buf->h_final_hashes);
 }
 
-static int cuda_execute_full_pipeline(cuda_full_buffers_t *buf, uint32_t work_items) {
+// Übergibt jetzt m_cost_kb (KiB) an den GPU-Pipeline-Wrapper
+static int cuda_execute_full_pipeline(cuda_full_buffers_t *buf,
+                                      uint32_t work_items,
+                                      uint32_t m_cost_kb)
+{
     cudaError_t err;
 
-    // Copy headers to GPU
-    err = cudaMemcpy(buf->d_headers, buf->h_headers, 80 * work_items, cudaMemcpyHostToDevice);
+    // 1) Headers H2D
+    err = cudaMemcpy(buf->d_headers, buf->h_headers, 80u * work_items, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy headers H2D failed: %s\n", cudaGetErrorString(err));
         return 0;
     }
 
-    // Launch Full RinHash Pipeline
-    err = rinhash_full_pipeline(buf->d_headers, buf->d_final_hashes, work_items, RIN_ARGON2_M_KIB);
+    // 2) Launch Full RinHash Pipeline (BLAKE3 -> Argon2d -> SHA3)
+    err = rinhash_full_pipeline(buf->d_headers, buf->d_final_hashes, work_items, m_cost_kb);
     if (err != cudaSuccess) {
         fprintf(stderr, "Full pipeline kernel failed: %s\n", cudaGetErrorString(err));
         return 0;
     }
 
-    // Synchronize
+    // 3) Sync
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "Full pipeline synchronize failed: %s\n", cudaGetErrorString(err));
         return 0;
     }
 
-    // Copy final hashes back
-    err = cudaMemcpy(buf->h_final_hashes, buf->d_final_hashes, 32 * work_items, cudaMemcpyDeviceToHost);
+    // 4) Final Hashes D2H
+    err = cudaMemcpy(buf->h_final_hashes, buf->d_final_hashes, 32u * work_items, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy final_hashes D2H failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "cudaMemcpy final hashes D2H failed: %s\n", cudaGetErrorString(err));
         return 0;
     }
 
     return 1;
 }
+
 
 // ============================ MAIN ============================
 
@@ -780,13 +787,12 @@ int main(int argc, char **argv) {
         if (b > 0 && b <= 8192) BATCH = (uint32_t)b;
     }
 
-    uint32_t chunk = 256;
+    uint32_t requested_chunk = 256;
     if (getenv("RIN_CHUNK")) {
         int c = atoi(getenv("RIN_CHUNK"));
-        if (c > 0) chunk = (uint32_t)c;
+        if (c > 0) requested_chunk = (uint32_t)c;
     }
-    if (chunk > BATCH) chunk = BATCH;
-    if (chunk < 1) chunk = 1;
+    if (requested_chunk < 1) requested_chunk = 1;
 
     const char *wallet_env = getenv("WALLET");
     const char *pass_env = getenv("POOL_PASS");
@@ -794,9 +800,19 @@ int main(int argc, char **argv) {
     const char *PASS = pass_env && pass_env[0] ? pass_env : DEFAULT_PASS;
 
     printf("=== RinHash Full-GPU CUDA Miner ===\n");
-    printf("Batch: %u (chunk=%u)\n", BATCH, chunk);
+    printf("Batch: %u (chunk=%u)\n", BATCH, requested_chunk);
+    double last_batch_ms = 0.0;
     printf("Wallet: %s\n", WAL);
     printf("Pipeline: BLAKE3(GPU) -> Argon2d(GPU) -> SHA3-256(GPU)\n");
+
+    // --- Argon2d memory cost (in KiB) ---
+    uint32_t m_cost_kb = RIN_ARGON2_M_KIB;   // Default aus rinhash_params.h (Pool: 65536)
+    if (const char* m_env = getenv("RIN_M_KIB")) {
+        long tmp = strtol(m_env, nullptr, 10);
+        if (tmp >= 64 && tmp <= 65536) m_cost_kb = (uint32_t)tmp;
+    }
+    printf("Argon2d m_cost = %u KiB\n", m_cost_kb);
+
 
     // CUDA Setup
     if (!cuda_setup_device()) {
@@ -932,51 +948,56 @@ int main(int argc, char **argv) {
         }
         uint32_t submit_ntime = batch_job.ntime + (nroll ? (g_batch_counter % (uint32_t)nroll) : 0);
 
-        // Header Building für GPU
-        uint32_t workN = chunk;
-        for (uint32_t i = 0; i < workN; i++) {
-            uint32_t nonce = nonce_base + i;
-            uint8_t header[80];
-            build_header_le(&batch_job, batch_prevhash_le, merkleroot_le,
-                           submit_ntime, batch_job.nbits, nonce, header);
+        // Header Building & GPU execution (tiled)
+        uint32_t remaining = requested_chunk;
+        while (remaining > 0) {
+            uint32_t workN = (remaining > BATCH) ? BATCH : remaining;
 
-            // Header direkt in GPU-Buffer
-            memcpy(&buffers.h_headers[i * 80], header, 80);
-        }
-        nonce_base += workN;
-
-        // GPU Pipeline Execution
-        uint64_t t0 = mono_ms();
-        
-        if (!cuda_execute_full_pipeline(&buffers, workN)) {
-            fprintf(stderr, "Full pipeline execution failed\n");
-            break;
-        }
-
-        uint64_t t1 = mono_ms();
-        double batch_ms = (double)(t1 - t0);
-        hashes_window += workN;
-
-        // Clean job check
-        if (!clean_at_start && g_last_notify_clean && g_job_gen != batch_gen) {
-            goto after_submit;
-        }
-
-        // Target Check
-        for (uint32_t i = 0; i < workN; i++) {
-            uint8_t *final_hash = &buffers.h_final_hashes[i * 32];
-            update_statistics(final_hash);
-
-            if (hash_meets_target_be(final_hash, g_share_target_be)) {
-                uint32_t nonce = (nonce_base - workN) + i;
-                if (g_debug || g_accepted_shares + g_rejected_shares < 5) {
-                    printf("\nSHARE FOUND! job=%s nonce=%08x", J.job_id, nonce);
-                    fflush(stdout);
-                }
-                stratum_submit(&S, &batch_job, en2_hex, submit_ntime, nonce);
+            // Header-Building für diese Kachel
+            uint32_t tile_nonce_base = nonce_base;
+            for (uint32_t i = 0; i < workN; i++) {
+                uint32_t nonce = tile_nonce_base + i;
+                uint8_t header[80];
+                build_header_le(&batch_job, batch_prevhash_le, merkleroot_le,
+                                submit_ntime, batch_job.nbits, nonce, header);
+                memcpy(&buffers.h_headers[i * 80], header, 80);
             }
-        }
+            nonce_base += workN;
 
+            // GPU Pipeline Execution
+            uint64_t t0 = mono_ms();
+            if (!cuda_execute_full_pipeline(&buffers, workN, m_cost_kb)) {
+                fprintf(stderr, "Full pipeline execution failed\n");
+                break;
+            }
+            uint64_t t1 = mono_ms();
+            double batch_ms = (double)(t1 - t0);
+            last_batch_ms = batch_ms;
+            hashes_window += workN;
+
+
+            // Clean job check
+            if (!clean_at_start && g_last_notify_clean && g_job_gen != batch_gen) {
+                goto after_submit;
+            }
+
+            // Target Check (nur diese Kachel)
+            for (uint32_t i = 0; i < workN; i++) {
+                uint8_t *final_hash = &buffers.h_final_hashes[i * 32];
+                update_statistics(final_hash);
+
+                if (hash_meets_target_be(final_hash, g_share_target_be)) {
+                    uint32_t nonce = tile_nonce_base + i;
+                    if (g_debug || g_accepted_shares + g_rejected_shares < 5) {
+                        printf("\nSHARE FOUND! job=%s nonce=%08x", J.job_id, nonce);
+                        fflush(stdout);
+                    }
+                    stratum_submit(&S, &batch_job, en2_hex, submit_ntime, nonce);
+                }
+            }
+
+            remaining -= workN;
+        }
 after_submit:
         g_batch_counter++;
 
@@ -992,7 +1013,7 @@ after_submit:
             double secs = (now - t_rate) / 1000.0;
             double rate = (double)hashes_window / secs;
             printf("Rate: %.1f H/s | Pipeline: %.1fms | Job: %s | Shares: %u/%u\r",
-                   rate, batch_ms, J.job_id[0] ? J.job_id : "-", g_accepted_shares, g_rejected_shares);
+                   rate, last_batch_ms, J.job_id[0] ? J.job_id : "-", g_accepted_shares, g_rejected_shares);
             fflush(stdout);
             t_rate = now;
             hashes_window = 0;
